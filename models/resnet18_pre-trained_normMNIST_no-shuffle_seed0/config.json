@@ -1,0 +1,16 @@
+{
+  "model": "resnet18",
+  "pretrained": true,
+  "shuffle": false,
+  "seed": 0,
+  "normalization": "MNIST",
+  "epochs": 20,
+  "batch_size": 1024,
+  "learning_rate": 0.0001,
+  "weight_decay": 0.0001,
+  "optimizer": "Adam",
+  "criterion": "CrossEntropyLoss",
+  "num_train_samples": 48000,
+  "num_val_samples": 12000,
+  "num_test_samples": 10000
+}

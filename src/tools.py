@@ -1,9 +1,13 @@
+import csv
+import json
 import random
 import time
+from pathlib import Path
 from typing import Any, Literal, Optional
 
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 import torchvision
@@ -48,6 +52,8 @@ def train_model(
     scheduler: Optional[LRScheduler] = None,
     device: torch.device = torch.device("cpu"),
     verbose: bool = True,
+    save_plots: bool = True,
+    config: Optional[dict[str, Any]] = None,
 ) -> tuple[Module, list[float], list[float], list[float]]:
     """Train a PyTorch model with validation monitoring and early stopping.
 
@@ -89,6 +95,10 @@ def train_model(
     model = model.to(device)
     criterion = criterion.to(device)  # some criterion have parameters
 
+    # Setup metrics tracker
+    run_dir = Path(file_path).parent
+    tracker = MetricsTracker(run_dir, config=config)
+
     # Track the best model state
     best_model_state: Optional[dict[str, torch.Tensor]] = {
         k: v.cpu().clone() for k, v in model.state_dict().items()
@@ -104,6 +114,7 @@ def train_model(
         model.train()  # set the model in training mode
 
         epoch_loss: float = 0.0
+        epoch_correct: int = 0
         n_samples: int = 0
 
         t0: float = time.time()
@@ -124,14 +135,12 @@ def train_model(
             # Update the current epoch loss
             # "loss.item()" is the loss averaged over the batch, so multiply it with the current batch size to get the total batch loss
             epoch_loss += loss.item() * x.size(0)
+            epoch_correct += (logits.argmax(1) == y).sum().item()
             n_samples += x.size(0)
 
-        # Update learning rate scheduler if provided
-        if scheduler is not None:
-            scheduler.step()
-
-        # Calculate average training loss
+        # Compute training metrics
         avg_train_loss = epoch_loss / n_samples
+        train_accuracy = epoch_correct / n_samples
         train_losses.append(avg_train_loss)
 
         # Evaluate on validation set
@@ -141,13 +150,36 @@ def train_model(
         validation_losses.append(validation_loss)
         validation_accuracies.append(validation_accuracy)
 
+        # Get current learning rate
+        current_lr = optimizer.param_groups[0]["lr"]
+
+        # Update learning rate scheduler if provided
+        if scheduler is not None:
+            scheduler.step()
+
+        # Time taken
+        epoch_time = time.time() - t0
+
+        # Log to CSV
+        tracker.log_epoch(
+            epoch=epoch,
+            train_loss=avg_train_loss,
+            train_acc=train_accuracy,
+            val_loss=validation_loss,
+            val_acc=validation_accuracy,
+            learning_rate=current_lr,
+            time_seconds=epoch_time,
+        )
+
         if verbose:
             print(
                 f"Epoch [{epoch}/{epochs}] | "
                 f"Train Loss: {avg_train_loss:.4f} | "
+                f"Train Acc: {train_accuracy * 100:.2f}% | "
                 f"Val Loss: {validation_loss:.4f} | "
                 f"Val Acc: {validation_accuracy * 100:.2f}% | "
-                f"Time: {time.time() - t0:.2f}s"
+                f"LR: {current_lr:.2e} | "
+                f"Time: {epoch_time:.2f}s"
             )
 
         # Save best model based on validation accuracy
@@ -161,6 +193,22 @@ def train_model(
     if best_model_state is not None:
         model.load_state_dict(best_model_state)
         torch.save(best_model_state, file_path)
+
+    # Close tracker and generate plots
+    tracker.close()
+
+    if save_plots:
+        tracker.save_plots()
+
+    if verbose:
+        print("\n" + "=" * 70)
+        print("Training completed!")
+        print(f"Best validation loss: {best_loss:.4f}")
+        print(f"Best validation accuracy: {max(validation_accuracies) * 100:.2f}%")
+        print(f"Model saved to: {file_path}")
+        print(f"Metrics saved to: {tracker.csv_path}")
+        print(f"Plots saved to: {tracker.plots_dir}/")
+        print("=" * 70 + "\n")
 
     return model, train_losses, validation_losses, validation_accuracies
 
@@ -765,5 +813,339 @@ def visualize_predictions_with_uncertainty(
         fontweight="bold",
         y=0.995,
     )
+
+    return fig
+
+
+class MetricsTracker:
+    """Track and save training metrics to CSV and generate plots.
+
+    Automatically creates a structured directory with metrics CSV, config JSON,
+    and visualization plots for a training run.
+
+    Args:
+        run_dir (str | Path): Directory to save all metrics and plots.
+        config (dict[str, Any], optional): Hyperparameters and config to save
+            as JSON. Defaults to None.
+
+    Example:
+        >>> tracker = MetricsTracker("models/resnet18_run1", config={"lr": 0.001})
+        >>> for epoch in range(10):
+        ...     tracker.log_epoch(epoch, train_loss=0.5, val_loss=0.4, val_acc=0.9)
+        >>> tracker.save_plots()
+
+    Attributes:
+        run_dir (Path): Root directory for this training run.
+        csv_path (Path): Path to metrics.csv file.
+        plots_dir (Path): Directory containing generated plots.
+        metrics (list[dict]): List of metric dictionaries for each epoch.
+    """
+
+    def __init__(self, run_dir: str | Path, config: Optional[dict[str, Any]] = None):
+        self.run_dir = Path(run_dir)
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+
+        # CSV file for metrics
+        self.csv_path = self.run_dir / "metrics.csv"
+        self.csv_file = None
+        self.csv_writer = None
+
+        # Plots directory
+        self.plots_dir = self.run_dir / "plots"
+        self.plots_dir.mkdir(exist_ok=True)
+
+        # Save config
+        if config is not None:
+            config_path = self.run_dir / "config.json"
+            with open(config_path, "w") as f:
+                json.dump(config, f, indent=2)
+
+        # Internal storage
+        self.metrics: list[dict[str, Any]] = []
+        self._init_csv()
+
+    def _init_csv(self) -> None:
+        """Initialize CSV file with headers."""
+        self.csv_file = open(self.csv_path, "w", newline="")
+        self.csv_writer = csv.DictWriter(
+            self.csv_file,
+            fieldnames=[
+                "epoch",
+                "train_loss",
+                "train_acc",
+                "val_loss",
+                "val_acc",
+                "learning_rate",
+                "time_seconds",
+            ],
+        )
+        self.csv_writer.writeheader()
+        self.csv_file.flush()
+
+    def log_epoch(
+        self,
+        epoch: int,
+        train_loss: float,
+        train_acc: float,
+        val_loss: float,
+        val_acc: float,
+        learning_rate: float = 0.0,
+        time_seconds: float = 0.0,
+    ) -> None:
+        """Log metrics for one epoch.
+
+        Args:
+            epoch (int): Current epoch number (1-indexed).
+            train_loss (float): Average training loss.
+            train_acc (float): Training accuracy in [0, 1].
+            val_loss (float): Average validation loss.
+            val_acc (float): Validation accuracy in [0, 1].
+            learning_rate (float, optional): Current learning rate. Defaults to 0.0.
+            time_seconds (float, optional): Time taken for this epoch in seconds.
+                Defaults to 0.0.
+
+        Example:
+            >>> tracker.log_epoch(1, 0.6, 0.75, 0.5, 0.82, lr=0.001, time_seconds=45.2)
+        """
+        row = {
+            "epoch": epoch,
+            "train_loss": f"{train_loss:.6f}",
+            "train_acc": f"{train_acc:.4f}",
+            "val_loss": f"{val_loss:.6f}",
+            "val_acc": f"{val_acc:.4f}",
+            "learning_rate": f"{learning_rate:.6e}",
+            "time_seconds": f"{time_seconds:.2f}",
+        }
+
+        self.csv_writer.writerow(row)
+        self.csv_file.flush()
+        self.metrics.append(row)
+
+    def close(self) -> None:
+        """Close CSV file."""
+        if self.csv_file is not None:
+            self.csv_file.close()
+
+    def save_plots(self) -> None:
+        """Generate and save all training plots.
+
+        Creates three plots:
+            - Loss curves (train + validation)
+            - Accuracy curves (train + validation)
+            - Learning rate schedule
+
+        Example:
+            >>> tracker.save_plots()  # After training completes
+        """
+        if not self.metrics:
+            return
+
+        df = pd.DataFrame(self.metrics)
+        df["epoch"] = df["epoch"].astype(int)
+        for col in ["train_loss", "train_acc", "val_loss", "val_acc", "learning_rate"]:
+            df[col] = df[col].astype(float)
+
+        # Plot 1: Loss curves
+        fig, ax = plt.subplots(figsize=(10, 6))
+        ax.plot(df["epoch"], df["train_loss"], label="Train Loss", linewidth=2)
+        ax.plot(df["epoch"], df["val_loss"], label="Val Loss", linewidth=2)
+        ax.set_xlabel("Epoch", fontsize=12)
+        ax.set_ylabel("Loss", fontsize=12)
+        ax.set_title("Training and Validation Loss", fontsize=14, fontweight="bold")
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        fig.savefig(self.plots_dir / "loss_curves.png", dpi=150, bbox_inches="tight")
+        plt.close(fig)
+
+        # Plot 2: Accuracy curves
+        fig, ax = plt.subplots(figsize=(10, 6))
+        ax.plot(df["epoch"], df["train_acc"] * 100, label="Train Accuracy", linewidth=2)
+        ax.plot(df["epoch"], df["val_acc"] * 100, label="Val Accuracy", linewidth=2)
+        ax.set_xlabel("Epoch", fontsize=12)
+        ax.set_ylabel("Accuracy (%)", fontsize=12)
+        ax.set_title("Training and Validation Accuracy", fontsize=14, fontweight="bold")
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        fig.savefig(
+            self.plots_dir / "accuracy_curves.png", dpi=150, bbox_inches="tight"
+        )
+        plt.close(fig)
+
+        # Plot 3: Learning rate
+        if df["learning_rate"].nunique() > 1:  # Only if LR changes
+            fig, ax = plt.subplots(figsize=(10, 6))
+            ax.plot(df["epoch"], df["learning_rate"], linewidth=2, color="orange")
+            ax.set_xlabel("Epoch", fontsize=12)
+            ax.set_ylabel("Learning Rate", fontsize=12)
+            ax.set_title("Learning Rate Schedule", fontsize=14, fontweight="bold")
+            ax.set_yscale("log")
+            ax.grid(True, alpha=0.3)
+            fig.savefig(
+                self.plots_dir / "learning_rate.png", dpi=150, bbox_inches="tight"
+            )
+            plt.close(fig)
+
+
+def load_metrics(run_dir: str | Path) -> pd.DataFrame:
+    """Load metrics from a training run's CSV file.
+
+    Args:
+        run_dir (str | Path): Directory containing metrics.csv.
+
+    Returns:
+        pd.DataFrame: DataFrame with columns: epoch, train_loss, train_acc,
+            val_loss, val_acc, learning_rate, time_seconds.
+
+    Example:
+        >>> df = load_metrics("models/resnet18_run1")
+        >>> print(df['val_acc'].max())  # Best validation accuracy
+        0.9876
+
+    Raises:
+        FileNotFoundError: If metrics.csv does not exist in run_dir.
+    """
+    run_dir = Path(run_dir)
+    csv_path = run_dir / "metrics.csv"
+
+    if not csv_path.exists():
+        raise FileNotFoundError(f"No metrics.csv found in {run_dir}")
+
+    df = pd.read_csv(csv_path)
+
+    # Convert types
+    if "epoch" in df.columns:
+        df["epoch"] = df["epoch"].astype(int)
+    for col in [
+        "train_loss",
+        "train_acc",
+        "val_loss",
+        "val_acc",
+        "learning_rate",
+        "time_seconds",
+    ]:
+        if col in df.columns:
+            df[col] = df[col].astype(float)
+
+    return df
+
+
+def load_config(run_dir: str | Path) -> dict[str, Any]:
+    """Load configuration from a training run's JSON file.
+
+    Args:
+        run_dir (str | Path): Directory containing config.json.
+
+    Returns:
+        dict[str, Any]: Configuration dictionary with hyperparameters.
+
+    Example:
+        >>> config = load_config("models/resnet18_run1")
+        >>> print(config['learning_rate'])
+        0.0001
+
+    Raises:
+        FileNotFoundError: If config.json does not exist in run_dir.
+    """
+    run_dir = Path(run_dir)
+    config_path = run_dir / "config.json"
+
+    if not config_path.exists():
+        raise FileNotFoundError(f"No config.json found in {run_dir}")
+
+    with open(config_path, "r") as f:
+        return json.load(f)
+
+
+def plot_metric_comparison(
+    run_dirs: list[str | Path],
+    metric: str = "val_acc",
+    labels: Optional[list[str]] = None,
+    title: Optional[str] = None,
+    smooth_window: Optional[int] = None,
+    save_path: Optional[str | Path] = None,
+    figsize: tuple[int, int] = (12, 6),
+) -> Figure:
+    """Compare a metric across multiple training runs.
+
+    Args:
+        run_dirs (list[str | Path]): List of run directories to compare.
+        metric (str, optional): Metric to plot. Must be a column in metrics.csv.
+            Options: 'train_loss', 'train_acc', 'val_loss', 'val_acc'.
+            Defaults to 'val_acc'.
+        labels (list[str], optional): Labels for each run in the legend. If None,
+            uses directory names. Defaults to None.
+        title (str, optional): Plot title. If None, auto-generates. Defaults to None.
+        smooth_window (int, optional): Window size for rolling average smoothing.
+            If None, no smoothing is applied. Defaults to None.
+        save_path (str | Path, optional): Path to save the figure. If None, figure
+            is not saved. Defaults to None.
+        figsize (tuple[int, int], optional): Figure size as (width, height).
+            Defaults to (12, 6).
+
+    Returns:
+        Figure: Matplotlib figure object.
+
+    Example:
+        >>> fig = plot_metric_comparison(
+        ...     run_dirs=["models/run1", "models/run2", "models/run3"],
+        ...     metric='val_acc',
+        ...     labels=["Pretrained", "From Scratch", "Fine-tuned"],
+        ...     title="Validation Accuracy Comparison",
+        ...     smooth_window=3,
+        ...     save_path="comparison.png"
+        ... )
+        >>> plt.show()
+
+    Raises:
+        ValueError: If metric is not found in any of the metrics.csv files.
+    """
+    if labels is None:
+        labels = [Path(d).name for d in run_dirs]
+
+    if len(labels) != len(run_dirs):
+        raise ValueError("labels and run_dirs must have the same length")
+
+    fig, ax = plt.subplots(figsize=figsize)
+
+    metric_names = {
+        "train_loss": "Training Loss",
+        "val_loss": "Validation Loss",
+        "train_acc": "Training Accuracy (%)",
+        "val_acc": "Validation Accuracy (%)",
+    }
+
+    for run_dir, label in zip(run_dirs, labels):
+        df = load_metrics(run_dir)
+
+        if metric not in df.columns:
+            raise ValueError(f"Metric '{metric}' not found in {run_dir}/metrics.csv")
+
+        x = df["epoch"]
+        y = df[metric].copy()
+
+        # Apply smoothing if requested
+        if smooth_window is not None and smooth_window > 1:
+            y = y.rolling(window=smooth_window, min_periods=1, center=False).mean()
+
+        # Convert accuracy to percentage
+        if "acc" in metric:
+            y = y * 100
+
+        ax.plot(x, y, label=label, linewidth=2)
+
+    ax.set_xlabel("Epoch", fontsize=12)
+    ax.set_ylabel(metric_names.get(metric, metric), fontsize=12)
+
+    if title is None:
+        title = f"{metric_names.get(metric, metric)} - Comparison"
+    ax.set_title(title, fontsize=14, fontweight="bold")
+
+    ax.legend(fontsize=10)
+    ax.grid(True, alpha=0.3)
+
+    if save_path is not None:
+        save_path = Path(save_path)
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(save_path, dpi=150, bbox_inches="tight")
 
     return fig
