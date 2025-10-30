@@ -315,6 +315,7 @@ def get_model_name(
     shuffle: bool = True,
     seed: int = 0,
     normalization: Literal["MNIST", "ImageNet"] = "MNIST",
+    model_number: Optional[int] = None,
 ) -> str:
     """Generate a standardized model filename based on training configuration.
 
@@ -342,7 +343,7 @@ def get_model_name(
     Note:
         The filename format is: {model}[_pre-trained]_norm{normalization}[_shuffle]_seed{seed}
     """
-    return f"{model}{'_pre-trained' if pretrained else ''}_norm{normalization}_{'shuffle' if shuffle else 'no-shuffle'}_seed{seed}"
+    return f"{model}{'_pre-trained' if pretrained else ''}_norm{normalization}_{'shuffle' if shuffle else 'no-shuffle'}_seed{seed}{f'_{model_number}' if model_number is not None else ''}"
 
 
 def init_weights(module: nn.Module, mode: str = "default") -> None:
