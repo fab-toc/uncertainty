@@ -9,5 +9,8 @@ wheels/
 # Virtual environments
 .venv
 
-# Logs
+# Dev folders
+data/
 logs/
+
+guidelines/

@@ -1,0 +1,769 @@
+import random
+import time
+from typing import Any, Literal, Optional
+
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
+import torch.nn as nn
+import torchvision
+import torchvision.transforms as transforms
+from matplotlib.figure import Figure
+from torch.nn import Module
+from torch.optim import Optimizer
+from torch.optim.lr_scheduler import LRScheduler
+from torch.utils.data import DataLoader
+from torchvision.models import ResNet, ResNet18_Weights, resnet18
+
+
+def seed_everything(seed: int = 0) -> None:
+    """Set random seeds for reproducibility across all libraries.
+
+    Ensures deterministic behavior for random number generation in Python's random module, NumPy, PyTorch (CPU and CUDA), and cuDNN operations.
+
+    Args:
+        seed (int, optional): Desired seed value. Defaults to 0.
+
+    Example:
+        >>> seed_everything(42)
+        >>> torch.rand(3)  # Will always produce the same output
+        tensor([0.8823, 0.9150, 0.3829])
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def train_model(
+    model: Module,
+    train_loader: DataLoader[Any],
+    validation_loader: DataLoader[Any],
+    criterion: Module,
+    optimizer: Optimizer,
+    file_path: str,
+    epochs: int = 50,
+    scheduler: Optional[LRScheduler] = None,
+    device: torch.device = torch.device("cpu"),
+    verbose: bool = True,
+) -> tuple[Module, list[float], list[float], list[float]]:
+    """Train a PyTorch model with validation monitoring and early stopping.
+
+    Trains the model for a specified number of epochs, evaluates on validation data after each epoch, and saves the model state with the best validation accuracy.
+
+    The model is trained in-place and the best weights are loaded before returning.
+
+    Args:
+        model (Module): Neural network model to train. Will be moved to the specified device.
+        train_loader (DataLoader): DataLoader providing batches of training data as (inputs, labels).
+        validation_loader (DataLoader): DataLoader providing batches of validation data.
+        criterion (Module): Loss function (e.g. CrossEntropyLoss()). Must be compatible with the model's output and target format. Defaults to `CrossEntropyLoss()`.
+        optimizer (Optimizer): Optimization algorithm (e.g., torch.optim.Adam(model.parameters())).
+        filename (str): Model filename to save the model dict.
+        epochs (int, optional): Number of training epochs to run. Defaults to 50.
+        scheduler (LRScheduler, optional): Optional learning rate scheduler that updates after each epoch. Defaults to None.
+        device (torch.device, optional): Device to perform training on. Defaults to `torch.device("cpu")`.
+        verbose (bool, optional): Whether to print training progress. Defaults to True.
+
+    Returns:
+        tuple: A 4-tuple containing:
+            - model (Module): Trained model with best validation weights loaded.
+            - train_losses (list[float]): Average training loss per epoch.
+            - validation_losses (list[float]): Average validation loss per epoch.
+            - validation_accuracies (list[float]): Validation accuracy per epoch.
+
+    Example:
+        >>> model = MyModel()
+        >>> optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=0.001)
+        >>> criterion = nn.CrossEntropyLoss()
+        >>> trained_model, train_loss, val_loss, val_acc = train_model(
+        ...     model, train_loader, val_loader, epochs=10,
+        ...     criterion=criterion, optimizer=optimizer,
+        ...     filename="model.pt", device=torch.device("cuda")
+        ... )
+        Epoch [1/10] | Train Loss: 0.6543 | Val Loss: 0.5234 | Val Acc: 78.45% | Time: 12.34s
+    """
+
+    model = model.to(device)
+    criterion = criterion.to(device)  # some criterion have parameters
+
+    # Track the best model state
+    best_model_state: Optional[dict[str, torch.Tensor]] = {
+        k: v.cpu().clone() for k, v in model.state_dict().items()
+    }
+    best_loss: float = float("inf")
+
+    # Initialize lists to store losses and accuracies over epochs
+    train_losses: list[float] = []
+    validation_losses: list[float] = []
+    validation_accuracies: list[float] = []
+
+    for epoch in range(1, epochs + 1):
+        model.train()  # set the model in training mode
+
+        epoch_loss: float = 0.0
+        n_samples: int = 0
+
+        t0: float = time.time()
+
+        # Iterate over batches
+        for x, y in train_loader:
+            x, y = x.to(device), y.to(device)
+
+            optimizer.zero_grad()  # zero the gradients for safety
+            logits = model(x)  # forward pass
+            loss = criterion(
+                logits, y
+            )  # compute loss between the predicted and true labels
+
+            loss.backward()  # backpropagate the gradients
+            optimizer.step()  # update model parameters with gradient descent
+
+            # Update the current epoch loss
+            # "loss.item()" is the loss averaged over the batch, so multiply it with the current batch size to get the total batch loss
+            epoch_loss += loss.item() * x.size(0)
+            n_samples += x.size(0)
+
+        # Update learning rate scheduler if provided
+        if scheduler is not None:
+            scheduler.step()
+
+        # Calculate average training loss
+        avg_train_loss = epoch_loss / n_samples
+        train_losses.append(avg_train_loss)
+
+        # Evaluate on validation set
+        validation_loss, validation_accuracy = evaluate(
+            model, validation_loader, criterion, device
+        )
+        validation_losses.append(validation_loss)
+        validation_accuracies.append(validation_accuracy)
+
+        if verbose:
+            print(
+                f"Epoch [{epoch}/{epochs}] | "
+                f"Train Loss: {avg_train_loss:.4f} | "
+                f"Val Loss: {validation_loss:.4f} | "
+                f"Val Acc: {validation_accuracy * 100:.2f}% | "
+                f"Time: {time.time() - t0:.2f}s"
+            )
+
+        # Save best model based on validation accuracy
+        if validation_loss < best_loss:
+            best_model_state = {
+                k: v.cpu().clone() for k, v in model.state_dict().items()
+            }
+            best_loss = validation_loss
+
+    # Load the best model state
+    if best_model_state is not None:
+        model.load_state_dict(best_model_state)
+        torch.save(best_model_state, file_path)
+
+    return model, train_losses, validation_losses, validation_accuracies
+
+
+@torch.no_grad()
+def evaluate(
+    model: Module,
+    loader: DataLoader[Any],
+    criterion: Module,
+    device: torch.device = torch.device("cpu"),
+) -> tuple[float, float]:
+    """Evaluate a PyTorch model on a dataset without computing gradients.
+
+    Computes the average loss and classification accuracy over all batches in the provided DataLoader.
+
+    The model is set to evaluation mode and no gradients are computed (via @torch.no_grad() decorator).
+
+    Args:
+        model: Neural network model to evaluate. Will be moved to the specified device.
+        loader: DataLoader providing batches of evaluation data as (inputs, labels).
+        criterion: Loss function used to compute the loss. Must match the training criterion. Defaults to `CrosEntropyLoss()`.
+        device: Device to perform evaluation on. Defaults to torch.device("cpu").
+
+    Returns:
+        tuple: A 2-tuple containing:
+            - avg_loss (float): Average loss over all samples.
+            - accuracy (float): Classification accuracy in [0, 1].
+
+    Example:
+        >>> model = MyModel()
+        >>> criterion = nn.CrossEntropyLoss()
+        >>> test_loss, test_acc = evaluate(model, test_loader, criterion, device)
+        >>> print(f"Test Loss: {test_loss:.4f}, Test Accuracy: {test_acc*100:.2f}%")
+        Test Loss: 0.3421, Test Accuracy: 89.34%
+
+    Note:
+        This function does not modify the model's state. It automatically sets the model to eval mode but does not restore the previous mode.
+    """
+
+    model = model.to(device)
+    criterion = criterion.to(device)  # some criterion have parameters
+
+    model.eval()  # set the model in evaluation mode
+
+    # Initialize metrics
+    total_loss: float = 0.0
+    total_correct: int = 0
+    n_samples: int = 0
+
+    for x, y in loader:
+        x, y = x.to(device), y.to(device)
+
+        logits = model(x)  # forward pass
+        loss = criterion(
+            logits, y
+        )  # compute loss between the predicted and true labels
+
+        # "loss.item()" is the loss averaged over the batch, so multiply it with the current batch size to get the total batch loss
+        total_loss += loss.item() * y.size(0)
+        total_correct += (logits.argmax(1) == y).sum().item()
+        n_samples += y.size(0)
+
+    avg_loss = total_loss / n_samples
+    accuracy = total_correct / n_samples
+
+    return avg_loss, accuracy
+
+
+def make_resnet18(num_classes: int, pretrained: bool = True) -> ResNet:
+    """Create a ResNet18 model with a custom classification head.
+
+    Loads a ResNet18 architecture and replaces the final fully connected layer to output the specified number of classes. Optionally initializes with ImageNet pre-trained weights.
+
+    Args:
+        num_classes: Number of output classes for the classification task.
+        pretrained: Whether to use ImageNet-1K pre-trained weights. If False, uses random initialization. Defaults to True.
+
+    Returns:
+        ResNet: ResNet18 model with modified final layer. The model is returned on CPU and should be moved to the desired device before use.
+
+    Example:
+        >>> # Create a ResNet18 for 10-class classification with pre-trained weights
+        >>> model = make_resnet18(num_classes=10, pretrained=True)
+        >>> model = model.to('cuda')
+        >>>
+        >>> # Create from scratch (no pre-training)
+        >>> model_scratch = make_resnet18(num_classes=100, pretrained=False)
+
+    Note:
+        The pre-trained weights are trained on ImageNet-1K with 1000 classes. Only the final layer is replaced; all other layers retain their weights if pretrained = True.
+    """
+
+    weights = ResNet18_Weights.IMAGENET1K_V1 if pretrained else None
+
+    model = resnet18(weights=weights, progress=True)
+    model.fc = nn.Linear(model.fc.in_features, num_classes)
+
+    return model
+
+
+def get_model_name(
+    model: str = "resnet18",
+    pretrained: bool = False,
+    shuffle: bool = True,
+    seed: int = 0,
+    normalization: Literal["MNIST", "ImageNet"] = "MNIST",
+) -> str:
+    """Generate a standardized model filename based on training configuration.
+
+    Creates a descriptive filename that encodes all important hyperparameters for reproducibility and experiment tracking.
+
+    Args:
+        model (str, optional): Model architecture name. Defaults to "resnet18".
+        pretrained (bool, optional): Whether pretrained weights were used.
+            Defaults to False.
+        shuffle (bool, optional): Whether data was shuffled during training.
+            Defaults to True.
+        seed (int, optional): Random seed used for training. Defaults to 0.
+        normalization (Literal["MNIST", "ImageNet"], optional): Normalization
+            strategy used. Defaults to "MNIST".
+
+    Returns:
+        str: Formatted model name encoding all parameters.
+
+    Example:
+        >>> get_model_name(pretrained=True, shuffle=False, seed=42, normalization="MNIST")
+        'resnet18_pt_normMNIST_seed42'
+        >>> get_model_name(pretrained=False, shuffle=True, seed=0, normalization="ImageNet")
+        'resnet18_normImageNet_shuffle_seed0'
+
+    Note:
+        The filename format is: {model}[_pre-trained]_norm{normalization}[_shuffle]_seed{seed}
+    """
+    return f"{model}{'_pre-trained' if pretrained else ''}_norm{normalization}_{'shuffle' if shuffle else 'no-shuffle'}_seed{seed}"
+
+
+def init_weights(module: nn.Module, mode: str = "default") -> None:
+    """Initialize weights of a neural network module.
+
+    Applies different weight initialization strategies to convolutional and linear layers. Biases are always initialized to zero.
+
+    Args:
+        module (nn.Module): PyTorch module to initialize.
+        mode (str, optional): Initialization strategy. Options are:
+            - "default": No initialization (keep PyTorch defaults or pretrained)
+            - "kaiming": Kaiming/He initialization for ReLU networks
+            - "xavier": Xavier/Glorot initialization for tanh/sigmoid networks
+            - "orthogonal": Orthogonal initialization for RNNs
+            Defaults to "default".
+
+    Raises:
+        ValueError: If mode is not one of the supported strategies.
+
+    Example:
+        >>> model = resnet18()
+        >>> model.apply(lambda m: init_weights(m, mode="kaiming"))
+
+    Note:
+        Only Conv2d and Linear layers are affected. Other layer types are ignored.
+    """
+
+    # default = ne rien toucher (poids pré-entraînés ou init PyTorch)
+    if mode == "default":
+        return
+
+    if isinstance(module, (nn.Conv2d, nn.Linear)):
+        if mode == "kaiming":
+            nn.init.kaiming_normal_(module.weight, mode="fan_out", nonlinearity="relu")
+        elif mode == "xavier":
+            nn.init.xavier_uniform_(module.weight)
+        elif mode == "orthogonal":
+            nn.init.orthogonal_(module.weight, gain=1.0)
+        else:
+            raise ValueError(f"init_mode inconnu pour init_weights: {mode}")
+        if module.bias is not None:
+            nn.init.zeros_(module.bias)
+
+
+def load_model(model: nn.Module, file_path: str, device: torch.device) -> nn.Module:
+    """Load a saved model from disk.
+
+    Loads the model's state dictionary from a file and moves it to the specified device.
+
+    Args:
+        model (nn.Module): Model instance to load weights into.
+        file_path (str): Path to the saved model state dict (.pt file).
+        device (torch.device): Device to load the model onto.
+
+    Returns:
+        nn.Module: Model with loaded weights on the specified device.
+
+    Example:
+        >>> model = resnet18(num_classes=10)
+        >>> model = load_model(model, "models/best_model.pt", torch.device("cuda"))
+
+    Note:
+        The model architecture must match the saved state dict.
+    """
+    model.load_state_dict(torch.load(file_path))
+    return model.to(device)
+
+
+def get_dataset_estimates(set: torch.utils.data.Dataset):
+    """Compute mean and standard deviation of a dataset.
+
+    Computes the global mean and standard deviation across all samples in the dataset. Useful for data normalization.
+
+    Args:
+        dataset (torch.utils.data.Dataset): PyTorch dataset that returns (image, label) tuples where images are tensors.
+
+    Returns:
+        tuple: A 2-tuple containing:
+            - mean (float): Mean pixel value across the entire dataset.
+            - std (float): Standard deviation of pixel values.
+
+    Example:
+        >>> mnist_train = datasets.MNIST(root, train=True, transform=ToTensor())
+        >>> mean, std = get_dataset_estimates(mnist_train)
+        >>> print(f"MNIST mean={mean:.4f}, std={std:.4f}")
+        MNIST mean=0.1307, std=0.3081
+
+    Note:
+        This function loads all data into memory. For large datasets, consider sampling or computing statistics incrementally.
+    """
+    data = torch.cat([x for x, _ in set], dim=0)  # concatenate all data
+    mean = data.mean().item()
+    std = data.std().item()
+    return mean, std
+
+
+def get_data_transforms(
+    data_root: str,
+    resize_value: int,
+    normalization: Literal["MNIST", "ImageNet"] = "MNIST",
+):
+    """Create data transformation pipeline for MNIST preprocessing.
+
+    Builds a transformation pipeline that resizes MNIST images to `resize_value x resize_value`, converts grayscale to RGB (3 channels), and applies normalization.
+
+    Supports both MNIST-specific normalization and ImageNet normalization for transfer learning.
+
+    Args:
+        data_root (str): Root directory containing the MNIST dataset.
+        resize_value (int): Target size to resize images to (e.g., 32 for 32x32).
+        normalization (Literal["MNIST", "ImageNet"], optional): Normalization strategy to use. "MNIST" computes statistics from the dataset, "ImageNet" uses ImageNet statistics for transfer learning. Defaults to "MNIST".
+
+    Returns:
+        transforms.Compose: Composed transformation pipeline.
+
+    Example:
+        >>> transforms = get_data_transforms("./data", resize_value=32, normalization="MNIST")
+        >>> dataset = datasets.MNIST("./data", train=True, transform=transforms)
+    """
+
+    # Compute mean & std of MNIST dataset
+    mean, std = get_dataset_estimates(
+        torchvision.datasets.MNIST(
+            data_root,
+            train=True,
+            download=True,
+            transform=transforms.ToTensor(),
+        )
+    )
+
+    # Duplicate on 3 channels for the model
+    MNIST_MEAN: list[float] = [mean, mean, mean]
+    MNIST_STD: list[float] = [std, std, std]
+
+    IMAGENET_MEAN: list[float] = ResNet18_Weights.IMAGENET1K_V1.transforms().mean
+    IMAGENET_STD: list[float] = ResNet18_Weights.IMAGENET1K_V1.transforms().std
+
+    tf = [
+        transforms.Resize((resize_value, resize_value)),
+        transforms.Grayscale(num_output_channels=3),
+        transforms.ToTensor(),
+    ]
+
+    tf.append(
+        transforms.Normalize(mean=MNIST_MEAN, std=MNIST_STD)
+        if normalization == "MNIST"
+        else transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD)
+    )
+
+    return transforms.Compose(tf)
+
+
+def get_loaders(
+    train_data: torch.utils.data.Dataset,
+    validation_data: torch.utils.data.Dataset,
+    test_data: torch.utils.data.Dataset,
+    shuffle: bool,
+    batch_size: int,
+    drop_last: bool,
+    num_workers: int = 0,
+) -> tuple[DataLoader[Any], DataLoader[Any], DataLoader[Any]]:
+    """Create DataLoaders for training, validation, and test datasets.
+
+    Creates three DataLoaders with consistent settings for batch size, shuffling, and parallel data loading.
+
+    Automatically enables pin_memory for GPU training and persistent_workers for efficiency.
+
+    Args:
+        train_data (torch.utils.data.Dataset): Training dataset.
+        validation_data (torch.utils.data.Dataset): Validation dataset.
+        test_data (torch.utils.data.Dataset): Test dataset.
+        shuffle (bool): Whether to shuffle the data at every epoch.
+        batch_size (int): Number of samples per batch.
+        drop_last (bool): Whether to drop the last incomplete batch.
+        num_workers (int, optional): Number of subprocesses for data loading.
+            Defaults to 0 (main process only).
+
+    Returns:
+        tuple: A 3-tuple containing:
+            - train_loader: DataLoader for training data.
+            - validation_loader: DataLoader for validation data.
+            - test_loader: DataLoader for test data.
+
+    Example:
+        >>> train_loader, val_loader, test_loader = get_loaders(
+        ...     train_data, val_data, test_data,
+        ...     shuffle=True, batch_size=128, drop_last=True, num_workers=4
+        ... )
+
+    Note:
+        pin_memory is always True for faster GPU transfers. persistent_workers is enabled when num_workers > 0 to avoid recreating workers each epoch.
+    """
+    train_loader = DataLoader(
+        train_data,
+        shuffle=shuffle,
+        batch_size=batch_size,
+        drop_last=drop_last,
+        num_workers=num_workers,
+        pin_memory=True,
+        persistent_workers=True if num_workers > 0 else False,
+        prefetch_factor=2 if num_workers > 0 else None,
+    )
+
+    validation_loader = DataLoader(
+        validation_data,
+        shuffle=shuffle,
+        batch_size=batch_size,
+        drop_last=drop_last,
+        num_workers=num_workers,
+        pin_memory=True,
+        persistent_workers=True if num_workers > 0 else False,
+        prefetch_factor=2 if num_workers > 0 else None,
+    )
+
+    test_loader = DataLoader(
+        test_data,
+        shuffle=shuffle,
+        batch_size=batch_size,
+        drop_last=drop_last,
+        num_workers=num_workers,
+        pin_memory=True,
+        persistent_workers=True if num_workers > 0 else False,
+        prefetch_factor=2 if num_workers > 0 else None,
+    )
+
+    return train_loader, validation_loader, test_loader
+
+
+def visualize_predictions(
+    model: Module,
+    dataset: torch.utils.data.Dataset,
+    device: torch.device = torch.device("cpu"),
+    num_samples: int = 20,
+    figsize: tuple[int, int] = (20, 8),
+) -> Figure:
+    """Visualize model predictions on random samples from a dataset.
+
+    Displays a grid of images with their true labels and predicted labels.
+    Correct predictions are shown in green, incorrect ones in red.
+
+    Args:
+        model (Module): Trained PyTorch model to use for predictions.
+        dataset (torch.utils.data.Dataset): Dataset to sample from (e.g., test set).
+        device (torch.device, optional): Device to perform inference on.
+            Defaults to torch.device("cpu").
+        num_samples (int, optional): Number of random samples to visualize.
+            Defaults to 20.
+        seed (int, optional): Random seed for reproducible sampling. If None,
+            sampling is non-deterministic. Defaults to None.
+        figsize (tuple[int, int], optional): Figure size as (width, height) in inches.
+            Defaults to (20, 8).
+
+    Returns:
+        Figure: Matplotlib figure containing the visualization grid.
+
+    Example:
+        >>> model = load_model(model, "models/best_model.pt", device)
+        >>> fig = visualize_predictions(model, test_data, device, num_samples=20, seed=42)
+        >>> plt.show()
+        >>> # Or save the figure
+        >>> fig.savefig("predictions.png", dpi=150, bbox_inches='tight')
+
+    Note:
+        - The model is automatically set to eval mode.
+        - Images are denormalized for display if they were normalized during training.
+        - Predictions show both the predicted class and confidence (softmax probability).
+    """
+    model = model.to(device)
+    model.eval()
+
+    # # Set seed for reproducibility if provided
+    # if seed is not None:
+    #     rng = torch.Generator()
+    #     rng.manual_seed(seed)
+    # else:
+    #     rng = None
+
+    # Sample random indices
+    indices = torch.randperm(len(dataset))[:num_samples].tolist()
+
+    # Create figure
+    num_cols = 5
+    num_rows = (num_samples + num_cols - 1) // num_cols  # Ceiling division
+    fig, axes = plt.subplots(num_rows, num_cols, figsize=figsize)
+    axes = axes.flatten() if num_samples > 1 else [axes]
+
+    with torch.no_grad():
+        for idx, ax in zip(indices, axes):
+            # Get image and label
+            image, true_label = dataset[idx]
+
+            # Prepare image for model (add batch dimension)
+            image_tensor = image.unsqueeze(0).to(device)
+
+            # Get prediction
+            logits = model(image_tensor)
+            probs = torch.softmax(logits, dim=1)
+            pred_label = logits.argmax(dim=1).item()
+            confidence = probs[0, pred_label].item()
+
+            # Denormalize image for display (convert from normalized to [0, 1])
+            # Assuming MNIST normalization: mean=[0.1307]*3, std=[0.3081]*3
+            img_display = image.permute(1, 2, 0).cpu().numpy()
+
+            # Simple denormalization (works for both MNIST and ImageNet norm)
+            img_display = (img_display - img_display.min()) / (
+                img_display.max() - img_display.min()
+            )
+
+            # Convert RGB back to grayscale for MNIST display
+            if img_display.shape[2] == 3:
+                img_display = img_display.mean(axis=2)
+
+            # Display image
+            ax.imshow(img_display, cmap="gray")
+            ax.axis("off")
+
+            # Set title with true and predicted labels
+            is_correct = pred_label == true_label
+            color = "green" if is_correct else "red"
+            title = f"True: {true_label}\nPred: {pred_label} ({confidence:.2%})"
+            ax.set_title(title, color=color, fontsize=10, fontweight="bold")
+
+    # Hide unused subplots
+    for ax in axes[len(indices) :]:
+        ax.axis("off")
+
+    plt.tight_layout()
+    return fig
+
+
+def visualize_predictions_with_uncertainty(
+    model: Module,
+    dataset: torch.utils.data.Dataset,
+    device: torch.device = torch.device("cpu"),
+    num_samples: int = 20,
+    num_mc_samples: int = 30,
+    figsize: tuple[int, int] = (20, 10),
+) -> Figure:
+    """Visualize predictions with uncertainty estimation using Monte Carlo Dropout.
+
+    Similar to visualize_predictions but includes uncertainty estimates from multiple
+    forward passes with dropout enabled. Shows mean prediction and uncertainty bars.
+
+    Args:
+        model (Module): Trained PyTorch model with dropout layers.
+        dataset (torch.utils.data.Dataset): Dataset to sample from.
+        device (torch.device, optional): Device for inference. Defaults to cpu.
+        num_samples (int, optional): Number of images to display. Defaults to 20.
+        num_mc_samples (int, optional): Number of Monte Carlo forward passes for
+            uncertainty estimation. Defaults to 30.
+        seed (int, optional): Random seed for reproducibility. Defaults to None.
+        figsize (tuple[int, int], optional): Figure size. Defaults to (20, 10).
+
+    Returns:
+        Figure: Matplotlib figure with predictions and uncertainty bars.
+
+    Example:
+        >>> fig = visualize_predictions_with_uncertainty(
+        ...     model, test_data, device, num_samples=20, num_mc_samples=50, seed=42
+        ... )
+        >>> plt.show()
+
+    Note:
+        - Requires the model to have dropout layers.
+        - Keeps dropout enabled during inference for uncertainty estimation.
+        - Higher num_mc_samples gives better uncertainty estimates but is slower.
+    """
+    model = model.to(device)
+
+    # Enable dropout for MC sampling
+    def enable_dropout(m):
+        if isinstance(m, nn.Dropout):
+            m.train()
+
+    model.apply(enable_dropout)
+
+    # # Set seed for reproducibility if provided
+    # if seed is not None:
+    #     rng = torch.Generator()
+    #     rng.manual_seed(seed)
+    # else:
+    #     rng = None
+
+    # Sample random indices
+    indices = torch.randperm(len(dataset))[:num_samples].tolist()
+
+    # Create figure with subplots for images and uncertainty bars
+    num_cols = 5
+    num_rows = (num_samples + num_cols - 1) // num_cols
+    fig = plt.figure(figsize=figsize)
+
+    # Create gridspec for better layout control
+    gs = fig.add_gridspec(num_rows * 2, num_cols, hspace=0.4, wspace=0.3)
+
+    with torch.no_grad():
+        for plot_idx, data_idx in enumerate(indices):
+            row = (plot_idx // num_cols) * 2
+            col = plot_idx % num_cols
+
+            # Get image and label
+            image, true_label = dataset[data_idx]
+            image_tensor = image.unsqueeze(0).to(device)
+
+            # Monte Carlo sampling
+            mc_predictions = []
+            for _ in range(num_mc_samples):
+                logits = model(image_tensor)
+                probs = torch.softmax(logits, dim=1)
+                mc_predictions.append(probs.cpu().numpy()[0])
+
+            mc_predictions = np.array(
+                mc_predictions
+            )  # Shape: (num_mc_samples, num_classes)
+
+            # Calculate statistics
+            mean_probs = mc_predictions.mean(axis=0)
+            std_probs = mc_predictions.std(axis=0)
+            pred_label = mean_probs.argmax()
+            confidence = mean_probs[pred_label]
+            uncertainty = std_probs[pred_label]
+
+            # Plot image
+            ax_img = fig.add_subplot(gs[row, col])
+            img_display = image.permute(1, 2, 0).cpu().numpy()
+            img_display = (img_display - img_display.min()) / (
+                img_display.max() - img_display.min()
+            )
+            if img_display.shape[2] == 3:
+                img_display = img_display.mean(axis=2)
+
+            ax_img.imshow(img_display, cmap="gray")
+            ax_img.axis("off")
+
+            is_correct = pred_label == true_label
+            color = "green" if is_correct else "red"
+            title = f"True: {true_label} | Pred: {pred_label}\n({confidence:.2%} ± {uncertainty:.2%})"
+            ax_img.set_title(title, color=color, fontsize=9, fontweight="bold")
+
+            # Plot uncertainty bars
+            ax_bar = fig.add_subplot(gs[row + 1, col])
+            num_classes = len(mean_probs)
+            x_pos = np.arange(num_classes)
+
+            bars = ax_bar.bar(
+                x_pos,
+                mean_probs,
+                yerr=std_probs,
+                capsize=3,
+                alpha=0.7,
+                color="steelblue",
+                error_kw={"elinewidth": 1},
+            )
+
+            # Highlight predicted class
+            bars[pred_label].set_color("green" if is_correct else "red")
+
+            ax_bar.set_ylim(0, 1)
+            ax_bar.set_xticks(x_pos)
+            ax_bar.set_xticklabels(x_pos, fontsize=7)
+            ax_bar.set_ylabel("Prob", fontsize=7)
+            ax_bar.tick_params(axis="y", labelsize=7)
+            ax_bar.grid(axis="y", alpha=0.3)
+
+    plt.suptitle(
+        f"Predictions with Uncertainty (MC Dropout, {num_mc_samples} samples)",
+        fontsize=14,
+        fontweight="bold",
+        y=0.995,
+    )
+
+    return fig
