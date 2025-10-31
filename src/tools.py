@@ -251,7 +251,7 @@ def evaluate(
     model = model.to(device)
     criterion = criterion.to(device)  # some criterion have parameters
 
-    model.eval()  # set the model in evaluation mode
+    model = model.eval()  # set the model in evaluation mode
 
     # Initialize metrics
     total_loss: float = 0.0
@@ -577,6 +577,7 @@ def visualize_predictions(
     dataset: torch.utils.data.Dataset,
     device: torch.device = torch.device("cpu"),
     num_samples: int = 20,
+    seed: Optional[int] = None,
     figsize: tuple[int, int] = (20, 8),
 ) -> Figure:
     """Visualize model predictions on random samples from a dataset.
@@ -614,15 +615,18 @@ def visualize_predictions(
     model = model.to(device)
     model.eval()
 
-    # # Set seed for reproducibility if provided
-    # if seed is not None:
-    #     rng = torch.Generator()
-    #     rng.manual_seed(seed)
-    # else:
-    #     rng = None
-
-    # Sample random indices
-    indices = torch.randperm(len(dataset))[:num_samples].tolist()
+    # Utiliser get_random_samples pour échantillonnage cohérent
+    if seed is not None:
+        samples, indices = get_random_samples(
+            dataset=dataset,
+            set_size=len(dataset),
+            seed=seed,
+            num_samples=num_samples,
+        )
+    else:
+        # Fallback sans seed
+        indices = random.sample(range(len(dataset)), num_samples)
+        samples = [dataset[idx] for idx in indices]
 
     # Create figure
     num_cols = 5
@@ -631,10 +635,7 @@ def visualize_predictions(
     axes = axes.flatten() if num_samples > 1 else [axes]
 
     with torch.no_grad():
-        for idx, ax in zip(indices, axes):
-            # Get image and label
-            image, true_label = dataset[idx]
-
+        for idx, (ax, (image, true_label)) in enumerate(zip(axes, samples)):
             # Prepare image for model (add batch dimension)
             image_tensor = image.unsqueeze(0).to(device)
 
@@ -644,11 +645,8 @@ def visualize_predictions(
             pred_label = logits.argmax(dim=1).item()
             confidence = probs[0, pred_label].item()
 
-            # Denormalize image for display (convert from normalized to [0, 1])
-            # Assuming MNIST normalization: mean=[0.1307]*3, std=[0.3081]*3
+            # Denormalize image for display
             img_display = image.permute(1, 2, 0).cpu().numpy()
-
-            # Simple denormalization (works for both MNIST and ImageNet norm)
             img_display = (img_display - img_display.min()) / (
                 img_display.max() - img_display.min()
             )
@@ -668,7 +666,7 @@ def visualize_predictions(
             ax.set_title(title, color=color, fontsize=10, fontweight="bold")
 
     # Hide unused subplots
-    for ax in axes[len(indices) :]:
+    for ax in axes[len(samples) :]:
         ax.axis("off")
 
     plt.tight_layout()
@@ -676,25 +674,23 @@ def visualize_predictions(
 
 
 def visualize_predictions_with_uncertainty(
-    model: Module,
+    models: list[Module],
     dataset: torch.utils.data.Dataset,
     device: torch.device = torch.device("cpu"),
     num_samples: int = 20,
-    num_mc_samples: int = 30,
+    seed: Optional[int] = None,
     figsize: tuple[int, int] = (20, 10),
 ) -> Figure:
-    """Visualize predictions with uncertainty estimation using Monte Carlo Dropout.
+    """Visualize ensemble predictions with uncertainty estimation.
 
-    Similar to visualize_predictions but includes uncertainty estimates from multiple
-    forward passes with dropout enabled. Shows mean prediction and uncertainty bars.
+    Shows predictions from an ensemble of models with uncertainty bars representing
+    the standard deviation across model predictions.
 
     Args:
-        model (Module): Trained PyTorch model with dropout layers.
+        models (list[Module]): List of trained models (ensemble).
         dataset (torch.utils.data.Dataset): Dataset to sample from.
         device (torch.device, optional): Device for inference. Defaults to cpu.
         num_samples (int, optional): Number of images to display. Defaults to 20.
-        num_mc_samples (int, optional): Number of Monte Carlo forward passes for
-            uncertainty estimation. Defaults to 30.
         seed (int, optional): Random seed for reproducibility. Defaults to None.
         figsize (tuple[int, int], optional): Figure size. Defaults to (20, 10).
 
@@ -703,33 +699,31 @@ def visualize_predictions_with_uncertainty(
 
     Example:
         >>> fig = visualize_predictions_with_uncertainty(
-        ...     model, test_data, device, num_samples=20, num_mc_samples=50, seed=42
+        ...     models, test_data, device, num_samples=20, seed=42
         ... )
         >>> plt.show()
 
     Note:
-        - Requires the model to have dropout layers.
-        - Keeps dropout enabled during inference for uncertainty estimation.
-        - Higher num_mc_samples gives better uncertainty estimates but is slower.
+        - Uses ensemble of models instead of MC Dropout.
+        - Uncertainty comes from disagreement between models.
+        - Higher standard deviation = higher uncertainty.
     """
-    model = model.to(device)
+    # Mettre tous les modèles en eval mode
+    for model in models:
+        model.to(device).eval()
 
-    # Enable dropout for MC sampling
-    def enable_dropout(m):
-        if isinstance(m, nn.Dropout):
-            m.train()
-
-    model.apply(enable_dropout)
-
-    # # Set seed for reproducibility if provided
-    # if seed is not None:
-    #     rng = torch.Generator()
-    #     rng.manual_seed(seed)
-    # else:
-    #     rng = None
-
-    # Sample random indices
-    indices = torch.randperm(len(dataset))[:num_samples].tolist()
+    # Utiliser get_random_samples pour échantillonnage cohérent
+    if seed is not None:
+        samples, indices = get_random_samples(
+            dataset=dataset,
+            set_size=len(dataset),
+            seed=seed,
+            num_samples=num_samples,
+        )
+    else:
+        # Fallback sans seed
+        indices = random.sample(range(len(dataset)), num_samples)
+        samples = [dataset[idx] for idx in indices]
 
     # Create figure with subplots for images and uncertainty bars
     num_cols = 5
@@ -740,28 +734,26 @@ def visualize_predictions_with_uncertainty(
     gs = fig.add_gridspec(num_rows * 2, num_cols, hspace=0.4, wspace=0.3)
 
     with torch.no_grad():
-        for plot_idx, data_idx in enumerate(indices):
+        for plot_idx, (image, true_label) in enumerate(samples):
             row = (plot_idx // num_cols) * 2
             col = plot_idx % num_cols
 
-            # Get image and label
-            image, true_label = dataset[data_idx]
             image_tensor = image.unsqueeze(0).to(device)
 
-            # Monte Carlo sampling
-            mc_predictions = []
-            for _ in range(num_mc_samples):
+            # Prédictions de tous les modèles de l'ensemble
+            ensemble_predictions = []
+            for model in models:
                 logits = model(image_tensor)
                 probs = torch.softmax(logits, dim=1)
-                mc_predictions.append(probs.cpu().numpy()[0])
+                ensemble_predictions.append(probs.cpu().numpy()[0])
 
-            mc_predictions = np.array(
-                mc_predictions
-            )  # Shape: (num_mc_samples, num_classes)
+            ensemble_predictions = np.array(
+                ensemble_predictions
+            )  # Shape: (num_models, num_classes)
 
             # Calculate statistics
-            mean_probs = mc_predictions.mean(axis=0)
-            std_probs = mc_predictions.std(axis=0)
+            mean_probs = ensemble_predictions.mean(axis=0)
+            std_probs = ensemble_predictions.std(axis=0)
             pred_label = mean_probs.argmax()
             confidence = mean_probs[pred_label]
             uncertainty = std_probs[pred_label]
@@ -809,7 +801,7 @@ def visualize_predictions_with_uncertainty(
             ax_bar.grid(axis="y", alpha=0.3)
 
     plt.suptitle(
-        f"Predictions with Uncertainty (MC Dropout, {num_mc_samples} samples)",
+        f"Ensemble Predictions with Uncertainty ({len(models)} models)",
         fontsize=14,
         fontweight="bold",
         y=0.995,
@@ -1150,3 +1142,527 @@ def plot_metric_comparison(
         fig.savefig(save_path, dpi=150, bbox_inches="tight")
 
     return fig
+
+
+@torch.no_grad()
+def get_mean_probs(
+    x: torch.Tensor,
+    models: list[nn.Module],
+    num_classes: int,
+    device: torch.device = torch.device("cpu"),
+) -> torch.Tensor:
+    """Retourne la moyenne des softmax sur les 7 modèles pour un batch x."""
+
+    probs_sum = torch.zeros(x.shape[0], num_classes, device=device)
+
+    for model in models:
+        model = model.to(device=device).eval()
+
+        logits = model(x.to(device=device))
+        probs = torch.softmax(logits, dim=1)
+        probs_sum += probs
+
+    return probs_sum / len(models)
+
+
+@torch.no_grad()
+def get_mean_probs_fast(
+    x: torch.Tensor,
+    models: list[nn.Module],
+    device: torch.device = torch.device("cpu"),
+) -> torch.Tensor:
+    """Version optimisée avec stack des prédictions."""
+    x = x.to(device)
+
+    # Collecter toutes les probs en une fois
+    all_probs = torch.stack(
+        [torch.softmax(model(x), dim=1) for model in models]
+    )  # Shape: (num_models, batch_size, num_classes)
+
+    # Moyenne sur la dimension des modèles
+    mean_probs = all_probs.mean(dim=0)  # Shape: (batch_size, num_classes)
+
+    return mean_probs
+
+
+def load_or_train_ensemble(
+    num_models: int,
+    num_classes: int,
+    train_loader: DataLoader[Any],
+    validation_loader: DataLoader[Any],
+    test_loader: DataLoader[Any],
+    criterion: Module,
+    epochs: int,
+    learning_rate: float,
+    weight_decay: float,
+    batch_size: int,
+    device: torch.device,
+    models_root: str,
+    pretrained: bool = False,
+    shuffle: bool = False,
+    normalization: Literal["MNIST", "ImageNet"] = "MNIST",
+    force_retrain: bool = False,
+    partial_load: bool = True,
+    verbose: bool = True,
+) -> tuple[list[Module], list[str]]:
+    """Load or train an ensemble of models for uncertainty estimation.
+
+    Automatically checks if models exist on disk. Supports three modes:
+        1. All models exist → Load all from disk
+        2. No models exist → Train all from scratch
+        3. Some models exist → Load existing + train missing (if partial_load=True)
+
+    Args:
+        num_models (int): Number of models in the ensemble (e.g., 7).
+        num_classes (int): Number of output classes.
+        train_loader (DataLoader): Training data loader.
+        validation_loader (DataLoader): Validation data loader.
+        test_loader (DataLoader): Test data loader.
+        criterion (Module): Loss function.
+        epochs (int): Number of training epochs per model.
+        learning_rate (float): Learning rate for optimizer.
+        weight_decay (float): Weight decay for optimizer.
+        batch_size (int): Batch size (for logging in config).
+        device (torch.device): Device to use for training/loading.
+        models_root (str): Root directory for saving/loading models.
+        pretrained (bool, optional): Use pretrained weights. Defaults to False.
+        shuffle (bool, optional): Shuffle training data. Defaults to False.
+        normalization (Literal["MNIST", "ImageNet"], optional): Normalization
+            strategy. Defaults to "MNIST".
+        force_retrain (bool, optional): Force retraining even if models exist.
+            If True, all existing models are deleted and retrained.
+            Defaults to False.
+        partial_load (bool, optional): Allow loading subset of models. If True
+            and only some models exist, loads existing ones and trains missing.
+            If False and not all models exist, trains all from scratch.
+            Defaults to True.
+        verbose (bool, optional): Print progress information. Defaults to True.
+
+    Returns:
+        tuple[list[Module], list[str]]: A 2-tuple containing:
+            - models (list[Module]): List of trained models on the specified device.
+            - model_paths (list[str]): List of paths to saved model files.
+
+    Example:
+        >>> # Case 1: Load all existing models
+        >>> models, paths = load_or_train_ensemble(
+        ...     num_models=7, num_classes=10, train_loader=train_loader,
+        ...     validation_loader=val_loader, test_loader=test_loader,
+        ...     criterion=nn.CrossEntropyLoss(), epochs=20,
+        ...     learning_rate=1e-4, weight_decay=1e-4, batch_size=512,
+        ...     device=torch.device("cuda"), models_root="../models"
+        ... )
+        ✓ Found 7 existing models. Loading from disk...
+
+        >>> # Case 2: Train all from scratch
+        >>> models, paths = load_or_train_ensemble(
+        ...     num_models=7, force_retrain=True, ...
+        ... )
+        ⚠ force_retrain=True. Training 7 models from scratch...
+
+        >>> # Case 3: Load 3 existing, train 4 missing
+        >>> models, paths = load_or_train_ensemble(
+        ...     num_models=7, partial_load=True, ...
+        ... )
+        ⚠ Found 3/7 existing models. Loading existing and training missing...
+
+    Note:
+        - Models are named using get_model_name() for consistency.
+        - Each model uses a different random seed (1 to num_models).
+        - Test accuracy is computed and logged after training each model.
+        - If force_retrain=True, existing model directories are deleted.
+    """
+    models: list[Module] = []
+    model_paths: list[str] = []
+    model_names: list[str] = []
+
+    # Generate model names and paths
+    for seed in range(1, num_models + 1):
+        model_name = get_model_name(
+            pretrained=pretrained,
+            shuffle=shuffle,
+            seed=seed,
+            normalization=normalization,
+            model_number=seed,
+        )
+        model_dir = Path(models_root) / model_name
+        model_path = model_dir / f"{model_name}.pt"
+
+        model_names.append(model_name)
+        model_paths.append(str(model_path))
+
+    # Check which models exist
+    existing_mask = [Path(p).exists() for p in model_paths]
+    num_existing = sum(existing_mask)
+    all_exist = num_existing == num_models
+    none_exist = num_existing == 0
+
+    # Handle force_retrain: delete all existing models
+    if force_retrain and num_existing > 0:
+        if verbose:
+            print(f"\n{'=' * 70}")
+            print(
+                f"⚠️  force_retrain=True. Deleting {num_existing} existing model(s)..."
+            )
+            print(f"{'=' * 70}\n")
+
+        for model_path in model_paths:
+            model_dir = Path(model_path).parent
+            if model_dir.exists():
+                import shutil
+
+                shutil.rmtree(model_dir)
+                if verbose:
+                    print(f"  🗑️  Deleted: {model_dir.name}")
+
+        existing_mask = [False] * num_models
+        num_existing = 0
+        all_exist = False
+        none_exist = True
+
+        if verbose:
+            print()
+
+    # Determine action based on what exists
+    if all_exist and not force_retrain:
+        # Case 1: All models exist → Load all
+        if verbose:
+            print(f"\n{'=' * 70}")
+            print(
+                f"✓ Found {num_models}/{num_models} existing models. Loading from disk..."
+            )
+            print(f"{'=' * 70}\n")
+
+        for seed, model_path in enumerate(model_paths, start=1):
+            model = make_resnet18(num_classes, pretrained=pretrained)
+            model = load_model(model, model_path, device)
+            model.eval()
+            models.append(model)
+
+            if verbose:
+                print(
+                    f"  ✓ Loaded model {seed}/{num_models}: {Path(model_path).parent.name}"
+                )
+
+        if verbose:
+            print(f"\n{'=' * 70}")
+            print(f"✓ All {num_models} models loaded successfully!")
+            print(f"{'=' * 70}\n")
+
+    elif none_exist or not partial_load:
+        # Case 2: No models exist OR partial_load disabled → Train all
+        if verbose:
+            print(f"\n{'=' * 70}")
+            if none_exist:
+                print("⚠️  No existing models found.")
+            else:
+                print(
+                    f"⚠️  Found {num_existing}/{num_models} models but partial_load=False."
+                )
+            print(f"Training all {num_models} models from scratch...")
+            print(f"{'=' * 70}\n")
+
+        models, model_paths = _train_all_models(
+            num_models=num_models,
+            num_classes=num_classes,
+            train_loader=train_loader,
+            validation_loader=validation_loader,
+            test_loader=test_loader,
+            criterion=criterion,
+            epochs=epochs,
+            learning_rate=learning_rate,
+            weight_decay=weight_decay,
+            batch_size=batch_size,
+            device=device,
+            models_root=models_root,
+            pretrained=pretrained,
+            shuffle=shuffle,
+            normalization=normalization,
+            verbose=verbose,
+        )
+
+    else:
+        # Case 3: Some models exist + partial_load=True → Load existing + train missing
+        if verbose:
+            print(f"\n{'=' * 70}")
+            print(f"⚠️  Found {num_existing}/{num_models} existing models.")
+            print("Loading existing and training missing models...")
+            print(f"{'=' * 70}\n")
+
+        for seed, (exists, model_path) in enumerate(
+            zip(existing_mask, model_paths), start=1
+        ):
+            if exists:
+                # Load existing model
+                model = make_resnet18(num_classes, pretrained=pretrained)
+                model = load_model(model, model_path, device)
+                model.eval()
+                models.append(model)
+
+                if verbose:
+                    print(
+                        f"  ✓ Loaded existing model {seed}/{num_models}: {Path(model_path).parent.name}"
+                    )
+
+            else:
+                # Train missing model
+                if verbose:
+                    print(f"\n  {'─' * 66}")
+                    print(
+                        f"  ⚙️  Training missing model {seed}/{num_models} (seed={seed})"
+                    )
+                    print(f"  {'─' * 66}\n")
+
+                model = _train_single_model(
+                    seed=seed,
+                    num_classes=num_classes,
+                    train_loader=train_loader,
+                    validation_loader=validation_loader,
+                    test_loader=test_loader,
+                    criterion=criterion,
+                    epochs=epochs,
+                    learning_rate=learning_rate,
+                    weight_decay=weight_decay,
+                    batch_size=batch_size,
+                    device=device,
+                    models_root=models_root,
+                    pretrained=pretrained,
+                    shuffle=shuffle,
+                    normalization=normalization,
+                    num_models=num_models,
+                    verbose=verbose,
+                )
+                models.append(model)
+
+        if verbose:
+            print(f"\n{'=' * 70}")
+            print(
+                f"✓ Ensemble ready: {num_existing} loaded + {num_models - num_existing} trained!"
+            )
+            print(f"{'=' * 70}\n")
+
+    return models, model_paths
+
+
+def _train_single_model(
+    seed: int,
+    num_classes: int,
+    train_loader: DataLoader[Any],
+    validation_loader: DataLoader[Any],
+    test_loader: DataLoader[Any],
+    criterion: Module,
+    epochs: int,
+    learning_rate: float,
+    weight_decay: float,
+    batch_size: int,
+    device: torch.device,
+    models_root: str,
+    pretrained: bool,
+    shuffle: bool,
+    normalization: Literal["MNIST", "ImageNet"],
+    num_models: int,
+    verbose: bool,
+) -> Module:
+    """Train a single model in the ensemble (internal helper function).
+
+    Args:
+        seed (int): Random seed for this specific model.
+        num_classes (int): Number of output classes.
+        train_loader (DataLoader): Training data loader.
+        validation_loader (DataLoader): Validation data loader.
+        test_loader (DataLoader): Test data loader.
+        criterion (Module): Loss function.
+        epochs (int): Number of training epochs.
+        learning_rate (float): Learning rate.
+        weight_decay (float): Weight decay.
+        batch_size (int): Batch size (for config logging).
+        device (torch.device): Training device.
+        models_root (str): Root directory for models.
+        pretrained (bool): Use pretrained weights.
+        shuffle (bool): Shuffle training data.
+        normalization (Literal["MNIST", "ImageNet"]): Normalization strategy.
+        num_models (int): Total number of models in ensemble (for config).
+        verbose (bool): Print progress.
+
+    Returns:
+        Module: Trained model on the specified device.
+    """
+    # Set seed for this model
+    seed_everything(seed=seed)
+
+    # Create model
+    model = make_resnet18(num_classes, pretrained=pretrained)
+
+    # Create optimizer
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        lr=learning_rate,
+        weight_decay=weight_decay,
+    )
+
+    # Prepare paths
+    model_name = get_model_name(
+        pretrained=pretrained,
+        shuffle=shuffle,
+        seed=seed,
+        normalization=normalization,
+        model_number=seed,
+    )
+    model_dir = Path(models_root) / model_name
+    model_dir.mkdir(parents=True, exist_ok=True)
+    model_path = model_dir / f"{model_name}.pt"
+
+    # Config for logging
+    config = {
+        "model": "resnet18",
+        "pretrained": pretrained,
+        "shuffle": shuffle,
+        "seed": seed,
+        "normalization": normalization,
+        "epochs": epochs,
+        "batch_size": batch_size,
+        "learning_rate": learning_rate,
+        "weight_decay": weight_decay,
+        "optimizer": "Adam",
+        "criterion": "CrossEntropyLoss",
+        "ensemble_id": seed,
+        "total_ensemble_size": num_models,
+    }
+
+    # Train
+    model, _, _, _ = train_model(
+        model=model,
+        train_loader=train_loader,
+        validation_loader=validation_loader,
+        criterion=criterion,
+        optimizer=optimizer,
+        epochs=epochs,
+        device=device,
+        file_path=str(model_path),
+        verbose=verbose,
+        save_plots=True,
+        config=config,
+    )
+
+    # Evaluate on test set
+    test_loss, test_accuracy = evaluate(
+        model, test_loader, criterion=criterion, device=device
+    )
+
+    if verbose:
+        print(
+            f"\n  ✓ Model {seed}/{num_models} completed | "
+            f"Test Loss: {test_loss:.4f} | Test Acc: {test_accuracy * 100:.2f}%\n"
+        )
+
+    return model
+
+
+def _train_all_models(
+    num_models: int,
+    num_classes: int,
+    train_loader: DataLoader[Any],
+    validation_loader: DataLoader[Any],
+    test_loader: DataLoader[Any],
+    criterion: Module,
+    epochs: int,
+    learning_rate: float,
+    weight_decay: float,
+    batch_size: int,
+    device: torch.device,
+    models_root: str,
+    pretrained: bool,
+    shuffle: bool,
+    normalization: Literal["MNIST", "ImageNet"],
+    verbose: bool,
+) -> tuple[list[Module], list[str]]:
+    """Train all models in the ensemble from scratch (internal helper function).
+
+    Returns:
+        tuple[list[Module], list[str]]: Trained models and their paths.
+    """
+    models: list[Module] = []
+    model_paths: list[str] = []
+
+    for seed in range(1, num_models + 1):
+        if verbose:
+            print(f"\n{'─' * 70}")
+            print(f"Training Model {seed}/{num_models} (seed={seed})")
+            print(f"{'─' * 70}\n")
+
+        model = _train_single_model(
+            seed=seed,
+            num_classes=num_classes,
+            train_loader=train_loader,
+            validation_loader=validation_loader,
+            test_loader=test_loader,
+            criterion=criterion,
+            epochs=epochs,
+            learning_rate=learning_rate,
+            weight_decay=weight_decay,
+            batch_size=batch_size,
+            device=device,
+            models_root=models_root,
+            pretrained=pretrained,
+            shuffle=shuffle,
+            normalization=normalization,
+            num_models=num_models,
+            verbose=verbose,
+        )
+
+        model_name = get_model_name(
+            pretrained=pretrained,
+            shuffle=shuffle,
+            seed=seed,
+            normalization=normalization,
+            model_number=seed,
+        )
+        model_dir = Path(models_root) / model_name
+        model_path = str(model_dir / f"{model_name}.pt")
+
+        models.append(model)
+        model_paths.append(model_path)
+
+    if verbose:
+        print(f"\n{'=' * 70}")
+        print(f"✓ All {num_models} models trained successfully!")
+        print(f"{'=' * 70}\n")
+
+    return models, model_paths
+
+
+def get_random_samples(
+    dataset: torch.utils.data.Dataset,
+    set_size: int,
+    seed: int,
+    num_samples: int = 20,
+) -> tuple[list[tuple[torch.Tensor, int]], list[int]]:
+    """Select random samples from a dataset with reproducible seeding.
+
+    Args:
+        dataset (torch.utils.data.Dataset): Dataset to sample from.
+        set_size (int): Total size of the dataset (len(dataset)).
+        seed (int): Random seed for reproducibility.
+        num_samples (int, optional): Number of samples to select. Defaults to 20.
+
+    Returns:
+        tuple[list[tuple[torch.Tensor, int]], list[int]]: A 2-tuple containing:
+            - samples: List of (image, label) tuples.
+            - indices: List of selected indices (useful for tracking).
+
+    Example:
+        >>> samples, indices = get_random_samples(
+        ...     test_data, len(test_data), seed=42, num_samples=20
+        ... )
+        >>> print(f"Selected indices: {indices}")
+        >>> imgs = torch.stack([img for img, _ in samples])
+        >>> labels = torch.tensor([y for _, y in samples])
+
+    Note:
+        Indices are returned sorted for reproducibility and easier tracking.
+    """
+    rng = random.Random(seed)
+    sel_idx = sorted(rng.sample(range(set_size), num_samples))
+    samples = [dataset[idx] for idx in sel_idx]
+
+    return samples, sel_idx
