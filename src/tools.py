@@ -18,6 +18,7 @@ from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
 from torch.utils.data import DataLoader
 from torchvision.models import ResNet, ResNet18_Weights, resnet18
+from torchvision.transforms import functional as TF
 
 
 def seed_everything(seed: int = 0) -> None:
@@ -54,7 +55,7 @@ def train_model(
     verbose: bool = True,
     save_plots: bool = True,
     config: Optional[dict[str, Any]] = None,
-) -> tuple[Module, list[float], list[float], list[float]]:
+) -> tuple[Module, list[float], list[float], list[float], list[float]]:
     """Train a PyTorch model with validation monitoring and early stopping.
 
     Trains the model for a specified number of epochs, evaluates on validation data after each epoch, and saves the model state with the best validation accuracy.
@@ -107,6 +108,8 @@ def train_model(
 
     # Initialize lists to store losses and accuracies over epochs
     train_losses: list[float] = []
+    train_accuracies: list[float] = []
+
     validation_losses: list[float] = []
     validation_accuracies: list[float] = []
 
@@ -142,13 +145,14 @@ def train_model(
         avg_train_loss = epoch_loss / n_samples
         train_accuracy = epoch_correct / n_samples
         train_losses.append(avg_train_loss)
+        train_accuracies.append(train_accuracy * 100)
 
         # Evaluate on validation set
         validation_loss, validation_accuracy = evaluate(
             model, validation_loader, criterion, device
         )
         validation_losses.append(validation_loss)
-        validation_accuracies.append(validation_accuracy)
+        validation_accuracies.append(validation_accuracy * 100)
 
         # Get current learning rate
         current_lr = optimizer.param_groups[0]["lr"]
@@ -210,7 +214,13 @@ def train_model(
         print(f"Plots saved to: {tracker.plots_dir}/")
         print("=" * 70 + "\n")
 
-    return model, train_losses, validation_losses, validation_accuracies
+    return (
+        model,
+        train_losses,
+        train_accuracies,
+        validation_losses,
+        validation_accuracies,
+    )
 
 
 @torch.no_grad()
@@ -312,7 +322,7 @@ def make_resnet18(num_classes: int, pretrained: bool = True) -> ResNet:
 def get_model_name(
     model: str = "resnet18",
     pretrained: bool = False,
-    shuffle: bool = True,
+    shuffle: bool = False,
     seed: int = 0,
     normalization: Literal["MNIST", "ImageNet"] = "MNIST",
     model_number: Optional[int] = None,
@@ -500,9 +510,9 @@ def get_loaders(
     train_data: torch.utils.data.Dataset,
     validation_data: torch.utils.data.Dataset,
     test_data: torch.utils.data.Dataset,
-    shuffle: bool,
     batch_size: int,
-    drop_last: bool,
+    shuffle: bool = False,
+    drop_last: bool = True,
     num_workers: int = 0,
 ) -> tuple[DataLoader[Any], DataLoader[Any], DataLoader[Any]]:
     """Create DataLoaders for training, validation, and test datasets.
@@ -574,59 +584,52 @@ def get_loaders(
 
 def visualize_predictions(
     model: Module,
-    dataset: torch.utils.data.Dataset,
+    samples: list[tuple[torch.Tensor, int]],
     device: torch.device = torch.device("cpu"),
-    num_samples: int = 20,
-    seed: Optional[int] = None,
     figsize: tuple[int, int] = (20, 8),
+    title: Optional[str] = None,  # ✅ NOUVEAU PARAMÈTRE
 ) -> Figure:
-    """Visualize model predictions on random samples from a dataset.
+    """Visualize model predictions on provided samples.
 
     Displays a grid of images with their true labels and predicted labels.
     Correct predictions are shown in green, incorrect ones in red.
 
     Args:
         model (Module): Trained PyTorch model to use for predictions.
-        dataset (torch.utils.data.Dataset): Dataset to sample from (e.g., test set).
+        samples (list[tuple[torch.Tensor, int]]): List of (image, label) tuples
+            to visualize. Can be obtained from get_random_samples().
         device (torch.device, optional): Device to perform inference on.
             Defaults to torch.device("cpu").
-        num_samples (int, optional): Number of random samples to visualize.
-            Defaults to 20.
-        seed (int, optional): Random seed for reproducible sampling. If None,
-            sampling is non-deterministic. Defaults to None.
         figsize (tuple[int, int], optional): Figure size as (width, height) in inches.
             Defaults to (20, 8).
+        title (str, optional): Title for the entire figure. If None, no title is added.
+            Defaults to None.
 
     Returns:
         Figure: Matplotlib figure containing the visualization grid.
 
     Example:
-        >>> model = load_model(model, "models/best_model.pt", device)
-        >>> fig = visualize_predictions(model, test_data, device, num_samples=20, seed=42)
+        >>> # Get random samples first
+        >>> samples, indices = tools.get_random_samples(
+        ...     test_data, len(test_data), seed=42, num_samples=20
+        ... )
+        >>>
+        >>> # Visualize with custom title
+        >>> fig = tools.visualize_predictions(
+        ...     model, samples, device,
+        ...     title="Model V2 - Pretrained (ImageNet)"
+        ... )
         >>> plt.show()
-        >>> # Or save the figure
-        >>> fig.savefig("predictions.png", dpi=150, bbox_inches='tight')
 
     Note:
         - The model is automatically set to eval mode.
-        - Images are denormalized for display if they were normalized during training.
+        - Images are converted using torchvision.transforms.functional.to_pil_image().
         - Predictions show both the predicted class and confidence (softmax probability).
     """
     model = model.to(device)
     model.eval()
 
-    # Utiliser get_random_samples pour échantillonnage cohérent
-    if seed is not None:
-        samples, indices = get_random_samples(
-            dataset=dataset,
-            set_size=len(dataset),
-            seed=seed,
-            num_samples=num_samples,
-        )
-    else:
-        # Fallback sans seed
-        indices = random.sample(range(len(dataset)), num_samples)
-        samples = [dataset[idx] for idx in indices]
+    num_samples = len(samples)
 
     # Create figure
     num_cols = 5
@@ -645,29 +648,46 @@ def visualize_predictions(
             pred_label = logits.argmax(dim=1).item()
             confidence = probs[0, pred_label].item()
 
-            # Denormalize image for display
-            img_display = image.permute(1, 2, 0).cpu().numpy()
-            img_display = (img_display - img_display.min()) / (
-                img_display.max() - img_display.min()
-            )
+            # Convert tensor to PIL Image
+            img_display = image.cpu().clone()
 
-            # Convert RGB back to grayscale for MNIST display
-            if img_display.shape[2] == 3:
-                img_display = img_display.mean(axis=2)
+            # Simple denormalization: bring to [0, 1] range
+            img_min = img_display.min()
+            img_max = img_display.max()
+            if img_max > img_min:
+                img_display = (img_display - img_min) / (img_max - img_min)
+
+            # Convert to PIL (automatically handles C x H x W format)
+            pil_img = TF.to_pil_image(img_display)
+
+            # Convert to grayscale if it's a 3-channel grayscale image
+            if pil_img.mode == "RGB":
+                # Check if all channels are identical (grayscale)
+                img_array = torch.tensor(np.array(pil_img))
+                if torch.allclose(
+                    img_array[:, :, 0], img_array[:, :, 1]
+                ) and torch.allclose(img_array[:, :, 1], img_array[:, :, 2]):
+                    pil_img = pil_img.convert("L")
 
             # Display image
-            ax.imshow(img_display, cmap="gray")
+            ax.imshow(pil_img, cmap="gray" if pil_img.mode == "L" else None)
             ax.axis("off")
 
             # Set title with true and predicted labels
             is_correct = pred_label == true_label
             color = "green" if is_correct else "red"
-            title = f"True: {true_label}\nPred: {pred_label} ({confidence:.2%})"
-            ax.set_title(title, color=color, fontsize=10, fontweight="bold")
+            title_text = f"True: {true_label}\nPred: {pred_label} ({confidence:.2%})"
+            ax.set_title(title_text, color=color, fontsize=10, fontweight="bold")
 
     # Hide unused subplots
     for ax in axes[len(samples) :]:
         ax.axis("off")
+
+    # ✅ AJOUT DU TITRE SI FOURNI
+    if title is not None:
+        fig.suptitle(
+            title, fontsize=16, fontweight="bold", y=0.98
+        )  # y=0.98 pour éviter le chevauchement
 
     plt.tight_layout()
     return fig
@@ -675,11 +695,10 @@ def visualize_predictions(
 
 def visualize_predictions_with_uncertainty(
     models: list[Module],
-    dataset: torch.utils.data.Dataset,
+    samples: list[tuple[torch.Tensor, int]],
     device: torch.device = torch.device("cpu"),
-    num_samples: int = 20,
-    seed: Optional[int] = None,
     figsize: tuple[int, int] = (20, 10),
+    title: Optional[str] = None,  # ✅ NOUVEAU PARAMÈTRE
 ) -> Figure:
     """Visualize ensemble predictions with uncertainty estimation.
 
@@ -688,18 +707,23 @@ def visualize_predictions_with_uncertainty(
 
     Args:
         models (list[Module]): List of trained models (ensemble).
-        dataset (torch.utils.data.Dataset): Dataset to sample from.
+        samples (list[tuple[torch.Tensor, int]]): List of (image, label) tuples
+            to visualize. Can be obtained from get_random_samples().
         device (torch.device, optional): Device for inference. Defaults to cpu.
-        num_samples (int, optional): Number of images to display. Defaults to 20.
-        seed (int, optional): Random seed for reproducibility. Defaults to None.
         figsize (tuple[int, int], optional): Figure size. Defaults to (20, 10).
 
     Returns:
         Figure: Matplotlib figure with predictions and uncertainty bars.
 
     Example:
-        >>> fig = visualize_predictions_with_uncertainty(
-        ...     models, test_data, device, num_samples=20, seed=42
+        >>> # Get random samples first
+        >>> samples, indices = tools.get_random_samples(
+        ...     test_data, len(test_data), seed=42, num_samples=20
+        ... )
+        >>>
+        >>> # Then visualize with uncertainty
+        >>> fig = tools.visualize_predictions_with_uncertainty(
+        ...     models, samples, device
         ... )
         >>> plt.show()
 
@@ -707,23 +731,13 @@ def visualize_predictions_with_uncertainty(
         - Uses ensemble of models instead of MC Dropout.
         - Uncertainty comes from disagreement between models.
         - Higher standard deviation = higher uncertainty.
+        - Uses torchvision.transforms.functional for image conversion.
     """
     # Mettre tous les modèles en eval mode
     for model in models:
         model.to(device).eval()
 
-    # Utiliser get_random_samples pour échantillonnage cohérent
-    if seed is not None:
-        samples, indices = get_random_samples(
-            dataset=dataset,
-            set_size=len(dataset),
-            seed=seed,
-            num_samples=num_samples,
-        )
-    else:
-        # Fallback sans seed
-        indices = random.sample(range(len(dataset)), num_samples)
-        samples = [dataset[idx] for idx in indices]
+    num_samples = len(samples)
 
     # Create figure with subplots for images and uncertainty bars
     num_cols = 5
@@ -745,29 +759,43 @@ def visualize_predictions_with_uncertainty(
             for model in models:
                 logits = model(image_tensor)
                 probs = torch.softmax(logits, dim=1)
-                ensemble_predictions.append(probs.cpu().numpy()[0])
+                ensemble_predictions.append(probs.cpu())
 
-            ensemble_predictions = np.array(
-                ensemble_predictions
-            )  # Shape: (num_models, num_classes)
+            # Stack predictions: Shape (num_models, 1, num_classes)
+            ensemble_predictions = torch.cat(ensemble_predictions, dim=0)
 
             # Calculate statistics
-            mean_probs = ensemble_predictions.mean(axis=0)
-            std_probs = ensemble_predictions.std(axis=0)
-            pred_label = mean_probs.argmax()
-            confidence = mean_probs[pred_label]
-            uncertainty = std_probs[pred_label]
+            mean_probs = ensemble_predictions.mean(dim=0).squeeze(
+                0
+            )  # Shape: (num_classes,)
+            std_probs = ensemble_predictions.std(dim=0).squeeze(
+                0
+            )  # Shape: (num_classes,)
+            pred_label = mean_probs.argmax().item()
+            confidence = mean_probs[pred_label].item()
+            uncertainty = std_probs[pred_label].item()
 
             # Plot image
             ax_img = fig.add_subplot(gs[row, col])
-            img_display = image.permute(1, 2, 0).cpu().numpy()
-            img_display = (img_display - img_display.min()) / (
-                img_display.max() - img_display.min()
-            )
-            if img_display.shape[2] == 3:
-                img_display = img_display.mean(axis=2)
 
-            ax_img.imshow(img_display, cmap="gray")
+            # Convert tensor to PIL Image
+            img_display = image.cpu().clone()
+            img_min = img_display.min()
+            img_max = img_display.max()
+            if img_max > img_min:
+                img_display = (img_display - img_min) / (img_max - img_min)
+
+            pil_img = TF.to_pil_image(img_display)
+
+            # Convert to grayscale if needed
+            if pil_img.mode == "RGB":
+                img_array = torch.tensor(np.array(pil_img))
+                if torch.allclose(
+                    img_array[:, :, 0], img_array[:, :, 1]
+                ) and torch.allclose(img_array[:, :, 1], img_array[:, :, 2]):
+                    pil_img = pil_img.convert("L")
+
+            ax_img.imshow(pil_img, cmap="gray" if pil_img.mode == "L" else None)
             ax_img.axis("off")
 
             is_correct = pred_label == true_label
@@ -778,12 +806,16 @@ def visualize_predictions_with_uncertainty(
             # Plot uncertainty bars
             ax_bar = fig.add_subplot(gs[row + 1, col])
             num_classes = len(mean_probs)
-            x_pos = np.arange(num_classes)
+            x_pos = torch.arange(num_classes)
+
+            # Convert to numpy for matplotlib
+            mean_probs_np = mean_probs.numpy()
+            std_probs_np = std_probs.numpy()
 
             bars = ax_bar.bar(
-                x_pos,
-                mean_probs,
-                yerr=std_probs,
+                x_pos.numpy(),
+                mean_probs_np,
+                yerr=std_probs_np,
                 capsize=3,
                 alpha=0.7,
                 color="steelblue",
@@ -794,18 +826,19 @@ def visualize_predictions_with_uncertainty(
             bars[pred_label].set_color("green" if is_correct else "red")
 
             ax_bar.set_ylim(0, 1)
-            ax_bar.set_xticks(x_pos)
-            ax_bar.set_xticklabels(x_pos, fontsize=7)
+            ax_bar.set_xticks(x_pos.numpy())
+            ax_bar.set_xticklabels(x_pos.numpy(), fontsize=7)
             ax_bar.set_ylabel("Prob", fontsize=7)
             ax_bar.tick_params(axis="y", labelsize=7)
             ax_bar.grid(axis="y", alpha=0.3)
 
-    plt.suptitle(
-        f"Ensemble Predictions with Uncertainty ({len(models)} models)",
-        fontsize=14,
-        fontweight="bold",
-        y=0.995,
-    )
+    # ✅ AJOUT DU TITRE SI FOURNI
+    if title is not None:
+        fig.suptitle(
+            title, fontsize=16, fontweight="bold", y=0.98
+        )  # y=0.98 pour éviter le chevauchement
+
+    plt.tight_layout()
 
     return fig
 
@@ -1646,9 +1679,9 @@ def get_random_samples(
         num_samples (int, optional): Number of samples to select. Defaults to 20.
 
     Returns:
-        tuple[list[tuple[torch.Tensor, int]], list[int]]: A 2-tuple containing:
-            - samples: List of (image, label) tuples.
-            - indices: List of selected indices (useful for tracking).
+        tuple: A 2-tuple containing:
+            samples (list[tuple[torch.Tensor, int]]): List of (image, label) tuples.
+            indices (list[int]): List of selected indices (useful for tracking).
 
     Example:
         >>> samples, indices = get_random_samples(
@@ -1666,3 +1699,215 @@ def get_random_samples(
     samples = [dataset[idx] for idx in sel_idx]
 
     return samples, sel_idx
+
+
+def add_pixel_noise(
+    x: torch.Tensor,
+    level: float,
+    gray: bool = True,
+):
+    if gray:
+        noise = torch.randn(x.size(0), 1, x.size(2), x.size(3), device=x.device).repeat(
+            1, 3, 1, 1
+        )
+    else:
+        noise = torch.randn_like(x)
+
+    x_noisy = torch.clamp(x + level * noise, 0.0, 1.0)
+    return x_noisy
+
+
+def get_best_model_from_ensemble(
+    models: list[Module],
+    model_paths: list[str],
+    test_loader: DataLoader[Any],
+    criterion: Module,
+    device: torch.device,
+    verbose: bool = True,
+) -> tuple[Module, str, float, int]:
+    """Select the best model from an ensemble based on test accuracy.
+
+    Evaluates all models in the ensemble on the test set and returns the one
+    with the highest accuracy.
+
+    Args:
+        models (list[Module]): List of trained models in the ensemble.
+        model_paths (list[str]): List of paths corresponding to each model.
+        test_loader (DataLoader): Test data loader for evaluation.
+        criterion (Module): Loss function for evaluation.
+        device (torch.device): Device to perform evaluation on.
+        verbose (bool, optional): Print comparison details. Defaults to True.
+
+    Returns:
+        tuple[Module, str, float, int]: A 4-tuple containing:
+            - best_model (Module): Model with highest test accuracy.
+            - best_path (str): Path to the best model's saved file.
+            - best_accuracy (float): Test accuracy of the best model.
+            - best_index (int): Index of the best model in the ensemble (1-indexed).
+
+    Example:
+        >>> models, paths = load_or_train_ensemble(...)
+        >>> best_model, best_path, best_acc, best_idx = get_best_model_from_ensemble(
+        ...     models, paths, test_loader, criterion, device
+        ... )
+        >>> print(f"Best model: #{best_idx} with {best_acc*100:.2f}% accuracy")
+        Best model: #3 with 98.76% accuracy
+
+    Note:
+        - All models are evaluated in eval mode.
+        - The best model is determined solely by test accuracy.
+        - If multiple models have the same accuracy, the first one is selected.
+    """
+    if verbose:
+        print(f"\n{'=' * 70}")
+        print("SELECTING BEST MODEL FROM ENSEMBLE")
+        print(f"{'=' * 70}\n")
+
+    best_accuracy = -1.0
+    best_model = None
+    best_path = None
+    best_index = -1
+
+    accuracies = []
+
+    for i, (model, path) in enumerate(zip(models, model_paths), start=1):
+        test_loss, test_accuracy = evaluate(
+            model, test_loader, criterion=criterion, device=device
+        )
+        accuracies.append(test_accuracy)
+
+        if verbose:
+            model_name = Path(path).parent.name
+            print(
+                f"Model {i}/{len(models)} ({model_name}): "
+                f"Loss = {test_loss:.4f} | Accuracy = {test_accuracy * 100:.2f}%"
+            )
+
+        if test_accuracy > best_accuracy:
+            best_accuracy = test_accuracy
+            best_model = model
+            best_path = path
+            best_index = i
+
+    if verbose:
+        print(f"\n{'─' * 70}")
+        print(f"✓ Best Model: #{best_index}/{len(models)}")
+        print(f"  Path: {Path(best_path).parent.name}")
+        print(f"  Test Accuracy: {best_accuracy * 100:.2f}%")
+        print(
+            f"  Improvement over mean: {(best_accuracy - np.mean(accuracies)) * 100:+.2f}%"
+        )
+        print(f"{'=' * 70}\n")
+
+    return best_model, best_path, best_accuracy, best_index
+
+
+def visualize_ensemble_predictions(
+    models: list[Module],
+    samples: list[tuple[torch.Tensor, int]],
+    device: torch.device = torch.device("cpu"),
+    figsize: tuple[int, int] = (20, 8),
+    title: Optional[str] = None,
+) -> Figure:
+    """Visualize ensemble predictions (mean of all models) without uncertainty bars.
+
+    Similar to visualize_predictions() but uses the mean prediction from an ensemble
+    of models instead of a single model. Shows predicted class and mean confidence.
+
+    Args:
+        models (list[Module]): List of trained models in the ensemble.
+        samples (list[tuple[torch.Tensor, int]]): List of (image, label) tuples.
+        device (torch.device, optional): Device for inference. Defaults to cpu.
+        figsize (tuple[int, int], optional): Figure size. Defaults to (20, 8).
+        title (str, optional): Title for the figure. If None, uses default
+            "Ensemble Predictions (N models)". Defaults to None.
+
+    Returns:
+        Figure: Matplotlib figure with ensemble predictions.
+
+    Example:
+        >>> samples, _ = get_random_samples(test_data, len(test_data), 42, 20)
+        >>> fig = visualize_ensemble_predictions(
+        ...     models, samples, device,
+        ...     title="Ensemble of 7 Models - Mean Predictions"
+        ... )
+        >>> plt.show()
+
+    Note:
+        - Predictions are the argmax of the mean softmax across all models.
+        - Confidence is the max probability from the mean softmax.
+        - No uncertainty bars are shown (unlike visualize_predictions_with_uncertainty).
+    """
+    # Mettre tous les modèles en eval mode
+    for idx, model in enumerate(models):
+        models[idx] = model.to(device).eval()
+
+    num_samples = len(samples)
+
+    # Create figure
+    num_cols = 5
+    num_rows = (num_samples + num_cols - 1) // num_cols
+    fig, axes = plt.subplots(num_rows, num_cols, figsize=figsize)
+    axes = axes.flatten() if num_samples > 1 else [axes]
+
+    with torch.no_grad():
+        for idx, (ax, (image, true_label)) in enumerate(zip(axes, samples)):
+            # Prepare image (add batch dimension)
+            image_tensor = image.unsqueeze(0).to(device)
+
+            # Get predictions from all models
+            ensemble_probs = []
+            for model in models:
+                logits = model(image_tensor)
+                probs = torch.softmax(logits, dim=1)
+                ensemble_probs.append(probs)
+
+            # Stack and compute mean: (num_models, 1, num_classes) -> (num_classes,)
+            ensemble_probs = torch.cat(
+                ensemble_probs, dim=0
+            )  # (num_models, num_classes)
+            mean_probs = ensemble_probs.mean(dim=0)  # (num_classes,)
+
+            # Get prediction from mean
+            pred_label = mean_probs.argmax().item()
+            confidence = mean_probs[pred_label].item()
+
+            # Convert image to PIL
+            img_display = image.cpu().clone()
+            img_min = img_display.min()
+            img_max = img_display.max()
+            if img_max > img_min:
+                img_display = (img_display - img_min) / (img_max - img_min)
+
+            pil_img = TF.to_pil_image(img_display)
+
+            # Convert to grayscale if needed
+            if pil_img.mode == "RGB":
+                img_array = torch.tensor(np.array(pil_img))
+                if torch.allclose(
+                    img_array[:, :, 0], img_array[:, :, 1]
+                ) and torch.allclose(img_array[:, :, 1], img_array[:, :, 2]):
+                    pil_img = pil_img.convert("L")
+
+            # Display image
+            ax.imshow(pil_img, cmap="gray" if pil_img.mode == "L" else None)
+            ax.axis("off")
+
+            # Set title
+            is_correct = pred_label == true_label
+            color = "green" if is_correct else "red"
+            title_text = f"True: {true_label}\nPred: {pred_label} ({confidence:.2%})"
+            ax.set_title(title_text, color=color, fontsize=10, fontweight="bold")
+
+    # Hide unused subplots
+    for ax in axes[len(samples) :]:
+        ax.axis("off")
+
+    # Add title if provided
+    if title is None:
+        title = f"Ensemble Predictions ({len(models)} models)"
+
+    fig.suptitle(title, fontsize=16, fontweight="bold", y=0.98)
+
+    plt.tight_layout()
+    return fig
